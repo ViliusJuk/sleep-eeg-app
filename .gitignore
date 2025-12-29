@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+
+# Data / models
+*.edf
+*.npz
+*.pth
+*.pt
+data/
+models/
+
+# Streamlit
+.streamlit/
+
+# OS
+.DS_Store
