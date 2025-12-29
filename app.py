@@ -7,9 +7,12 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from sklearn.metrics import confusion_matrix, accuracy_score, f1_score, cohen_kappa_score
 
 
 STAGE_NAMES = ["W", "N1", "N2", "N3", "REM"]
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
 ANNOT_MAP = {
     "Sleep stage W": 0,
@@ -50,6 +53,67 @@ def plot_epoch_signal(x_1d, sfreq, title="Epocha"):
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     return fig
+
+def plot_confusion(cm, title="Confusion matrix", figsize=(4.2, 3.2), font=8):
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.imshow(cm, interpolation="nearest")
+    ax.set_title(title, fontsize=font+2)
+    ax.set_xlabel("Pred", fontsize=font)
+    ax.set_ylabel("True", fontsize=font)
+    ax.set_xticks(range(5)); ax.set_yticks(range(5))
+    ax.set_xticklabels(STAGE_NAMES, fontsize=font)
+    ax.set_yticklabels(STAGE_NAMES, fontsize=font)
+
+    for i in range(5):
+        for j in range(5):
+            ax.text(j, i, str(cm[i, j]),
+                    ha="center", va="center", fontsize=font)
+
+    fig.tight_layout()
+    return fig
+
+
+def predict_full_night_batched(
+    model,
+    X: np.ndarray,          # (E,1,T)
+    seq_len: int,
+    batch_size: int = 64,
+    device: str = "cpu",
+    progress_cb=None,
+):
+    model.eval()
+    E = X.shape[0]
+    y_pred = np.zeros(E, dtype=np.int64)
+    probs_all = np.zeros((E, 5), dtype=np.float32)
+
+    with torch.no_grad():
+        for start in range(0, E, batch_size):
+            end = min(E, start + batch_size)
+
+            seq_batch = []
+            for i in range(start, end):
+                seq = make_center_sequence(X, i, int(seq_len))  # (L,T)
+                seq_batch.append(seq)
+
+            seq_batch = np.stack(seq_batch).astype(np.float32)
+
+            # z-score per epoch (kaip train'e)
+            mu = seq_batch.mean(axis=2, keepdims=True)
+            sd = seq_batch.std(axis=2, keepdims=True) + 1e-6
+            seq_batch = (seq_batch - mu) / sd
+
+            xb = torch.from_numpy(seq_batch).to(device)   # (B,L,T)
+            logits = model(xb)
+            pb = F.softmax(logits, dim=1).cpu().numpy()
+
+            y_pred[start:end] = pb.argmax(axis=1)
+            probs_all[start:end] = pb
+
+            if progress_cb is not None:
+                progress_cb(end / E)
+
+    return y_pred, probs_all
+
 
 def zscore_np(x: np.ndarray, eps: float = 1e-6) -> np.ndarray:
     """
@@ -274,16 +338,21 @@ window_len_min = st.sidebar.number_input("Window length (min)", value=180, min_v
 st.sidebar.divider()
 st.sidebar.header("Modelis (CNN+BiLSTM TorchScript)")
 
-model_file = st.sidebar.file_uploader(
+bilstm_file = st.sidebar.file_uploader(
     "Įkelk modelį `.pt` (TorchScript)",
     type=["pt"]
 )
 
 seq_len = st.sidebar.selectbox("Seq len (L)", [10, 20, 30, 40], index=1)  # default 20
-run_model = st.sidebar.checkbox("Rodyti modelio prognozę", value=True)
+run_bilstm = st.sidebar.checkbox("Rodyti modelio prognozę", value=True)
 
 
 load_btn = st.sidebar.button("Užkrauti", type="primary", use_container_width=True)
+
+run_full_night = st.sidebar.checkbox(
+    "Prognozuoti visą naktį",
+    value=False
+)
 
 st.sidebar.markdown("### Įkėlimo statusas")
 if psg is None:
@@ -484,229 +553,101 @@ else:
             st.error("BiLSTM inference nepavyko. Žemiau – klaidos detalės:")
             st.exception(e)
 
+st.divider()
+st.subheader("Visa naktis: modelio prognozės (CNN+BiLSTM)")
+
+run_full = st.button("▶ Prognozuoti visą naktį", use_container_width=True)
+batch_size = st.slider("Batch size (greitis/RAM)", 8, 256, 64, 8)
+
+# cache key: jei keiti modelį / seq_len / epochų skaičių – perskaičiuos
+cache_key = (st.session_state.get("bilstm_name", ""), int(seq_len), int(X.shape[0]), int(X.shape[2]))
+
+if run_full:
+    if bilstm_file is None:
+        st.warning("Pirma įkelk BiLSTM TorchScript modelį sidebar'e.")
+    else:
+        try:
+            prog = st.progress(0.0)
+            with st.spinner("Skaičiuoju prognozes visai nakčiai (batche'ais)..."):
+                y_pred_full, probs_full = predict_full_night_batched(
+                    model=model_bilstm,
+                    X=X,  # visa naktis (ne tik langas)
+                    seq_len=int(seq_len),
+                    batch_size=int(batch_size),
+                    device=device,
+                    progress_cb=lambda p: prog.progress(min(1.0, float(p))),
+                )
+
+            st.session_state.full_cache_key = cache_key
+            st.session_state.y_pred_full = y_pred_full
+            st.session_state.probs_full = probs_full
+
+            st.success("Prognozės visai nakčiai paruoštos ✅")
+
+        except Exception as e:
+            st.error("Nepavyko suskaičiuoti prognozių visai nakčiai.")
+            st.exception(e)
+
+# Jei turim cache’intą rezultatą – rodom
+if ("y_pred_full" in st.session_state) and (st.session_state.get("full_cache_key") == cache_key):
+    y_pred_full = st.session_state.y_pred_full
+
+    # Metrics
+    acc = accuracy_score(y, y_pred_full)
+    f1 = f1_score(y, y_pred_full, average="macro", zero_division=0)
+    kappa = cohen_kappa_score(y, y_pred_full)
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Accuracy (visa naktis)", f"{acc*100:.1f}%")
+    m2.metric("Macro-F1 (visa naktis)", f"{f1:.3f}")
+    m3.metric("Cohen’s κ", f"{kappa:.3f}")
+
+    # True vs Pred hypnograma
+    colA, colB = st.columns(2)
+    with colA:
+        st.pyplot(plot_hypnogram_time(starts_sec, y, title="True hipnograma (visa naktis)"))
+    with colB:
+        st.pyplot(plot_hypnogram_time(starts_sec, y_pred_full, title="Pred hipnograma (visa naktis)"))
+
+if run_full_night and model is not None:
+    with st.spinner("Skaičiuoju visos nakties prognozes..."):
+        X_all = X[:, 0, :]              # (E, T)
+        X_all = zscore_np(X_all)        # normalizacija kaip train'e
+
+        preds = []
+        with torch.no_grad():
+            for i in range(0, len(X_all), 64):
+                xb = torch.from_numpy(X_all[i:i+64]).unsqueeze(1).to(device)  # (B,1,T)
+                logits = model(xb)
+                pb = torch.argmax(logits, dim=1).cpu().numpy()
+                preds.append(pb)
+
+        y_pred_full = np.concatenate(preds, axis=0)
+
+
+ # ---------------------------------------
+
+    # Confusion matrix
+    cm = confusion_matrix(y, y_pred_full, labels=[0,1,2,3,4])
+    fig, ax = plt.subplots(figsize=(5,4))
+    im = ax.imshow(cm, interpolation="nearest")
+    ax.set_title("Confusion matrix (visa naktis)")
+    ax.set_xlabel("Pred")
+    ax.set_ylabel("True")
+    ax.set_xticks(range(5)); ax.set_yticks(range(5))
+    ax.set_xticklabels(STAGE_NAMES); ax.set_yticklabels(STAGE_NAMES)
+    for i in range(5):
+        for j in range(5):
+            ax.text(j, i, str(cm[i, j]), ha="center", va="center", fontsize=8)
+    fig.tight_layout()
+    st.pyplot(fig)
+
+else:
+    st.info("Paspausk **Prognozuoti visą naktį**, kad sugeneruočiau visos nakties pred hipnogramą ir metrikas.")
+
+
+
 # ---------------- Epoch signal plot ----------------
 st.pyplot(plot_epoch_signal(epoch, sfreq, title=f"Epochos signalas ({label_name})"))
 
-# ---------------- CNN inference (optional demo) ----------------
-if cnn_file is not None and run_cnn:
-    st.divider()
-    st.subheader("CNN modelio prognozė (demo)")
 
-    device = "cpu"
-    if torch.cuda.is_available():
-        use_gpu = st.sidebar.checkbox("Naudoti GPU (jei yra)", value=False)
-        device = "cuda" if use_gpu else "cpu"
-
-    try:
-        # cache model per filename
-        if ("cnn_model_name" not in st.session_state) or (st.session_state.cnn_model_name != cnn_file.name):
-            raw_bytes = cnn_file.getvalue()
-
-            model = None
-            # TorchScript
-            try:
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".pt") as tmp:
-                    tmp.write(raw_bytes)
-                    tmp.flush()
-                    tmp_path = tmp.name
-                model = torch.jit.load(tmp_path, map_location=device)
-                model.eval()
-                st.session_state.cnn_model_type = "torchscript"
-            except Exception:
-                model = None
-
-            # state_dict fallback (jei turi SimpleSleepCNN)
-            if model is None:
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".pth") as tmp:
-                    tmp.write(raw_bytes)
-                    tmp.flush()
-                    sd_path = tmp.name
-                state = torch.load(sd_path, map_location=device)
-
-                model = SimpleSleepCNN(n_classes=len(STAGE_NAMES)).to(device)
-                model.load_state_dict(state)
-                model.eval()
-                st.session_state.cnn_model_type = "state_dict(SimpleSleepCNN)"
-
-            st.session_state.cnn_model = model
-            st.session_state.cnn_model_name = cnn_file.name
-
-        model = st.session_state.cnn_model
-
-        # epoch input (B,1,T)
-        x = normalize_epoch(epoch).astype(np.float32)
-        x_t = torch.from_numpy(x).unsqueeze(0).unsqueeze(0).to(device)
-
-        with torch.no_grad():
-            logits = model(x_t)
-            probs = torch.softmax(logits, dim=-1).detach().cpu().numpy().reshape(-1)
-
-        pred_id = int(np.argmax(probs))
-        pred_name = STAGE_NAMES[pred_id]
-
-        st.write(f"**Modelis:** `{st.session_state.cnn_model_type}` | failas: `{st.session_state.cnn_model_name}`")
-        st.write(f"**True:** {label_name} | **Pred:** **{pred_name}**")
-        st.bar_chart({STAGE_NAMES[i]: float(probs[i]) for i in range(len(STAGE_NAMES))})
-
-    except Exception as e:
-        st.error("CNN modelio užkrovimas / predikcija nepavyko. Klaida:")
-        st.exception(e)
-
-st.divider()
-st.subheader("Modelio prognozės (paruošta plėtrai)")
-st.info("Čia vėliau prijungsi apmokytą CNN / BiLSTM / Transformer ir rodysi softmax tikimybes pasirinktai epochai.")
-
-# ---------------- Model inference (sequence) ----------------
-
-if model_file is None:
-    st.info("Jei nori prognozės – įkelk `cnn_bilstm_full_ts.pt` (TorchScript) į sidebar'ą.")
-else:
-    if run_model:
-        try:
-            # 1) Patikrink, ar T sutampa (modelis treniruotas su 30s @ 100Hz => T=3000)
-            T = Xw.shape[2]
-            expected_T = int(epoch_sec * sfreq)
-            if T != expected_T:
-                st.warning(f"Įtartina: Xw T={T}, bet epoch_sec*sfreq={expected_T}.")
-            if T != 3000:
-                st.warning(f"Modelis greičiausiai treniruotas su T=3000, pas tave T={T}. "
-                           f"Rekomendacija: epoch_sec=30 ir Resample=100Hz.")
-
-            # 2) Užkraunam modelį (cache)
-            model = load_torchscript_model_from_bytes(model_file.getvalue())
-
-            # 3) Sudarom seką aplink pasirinktą epochą
-            seq = make_center_sequence(Xw, e_idx, int(seq_len))      # (L, T)
-            seq = zscore_np(seq)                                     # zscore per epochą (kaip train'e)
-
-            # 4) Tensor: (B, L, T)
-            x = torch.from_numpy(seq).unsqueeze(0)                   # (1, L, T)
-
-            with torch.no_grad():
-                logits = model(x)                                    # (1, 5)
-                probs = F.softmax(logits, dim=1).squeeze(0).cpu().numpy()
-
-            pred_id = int(np.argmax(probs))
-            pred_name = stage_name_from_id(pred_id)
-            true_id = int(label_id)
-            true_name = stage_name_from_id(true_id)
-
-            st.subheader("Modelio prognozė (CNN+BiLSTM)")
-            m1, m2, m3 = st.columns(3)
-            m1.metric("True (center)", f"{true_name} ({true_id})")
-            m2.metric("Pred", f"{pred_name} ({pred_id})")
-            m3.metric("Confidence", f"{float(probs[pred_id]) * 100:.1f}%")
-
-            # Softmax bar chart
-            prob_dict = {STAGE_NAMES[i]: float(probs[i]) for i in range(len(STAGE_NAMES))}
-            st.bar_chart(prob_dict)
-
-        except Exception as e:
-            st.error("Modelio inference nepavyko. Žemiau – klaidos detalės:")
-            st.exception(e)
-
-st.pyplot(plot_epoch_signal(epoch, sfreq, title=f"Epochos signalas ({label_name})"))
-
-st.divider()
-st.subheader("CNN modelio prognozė (demo)")
-
-model_file = st.sidebar.file_uploader(
-    "Įkelk CNN modelį (TorchScript .pt/.ts arba state_dict .pth)",
-    type=["pt", "ts", "pth"]
-)
-
-device = "cpu"
-if torch.cuda.is_available():
-    use_gpu = st.sidebar.checkbox("Naudoti GPU (jei yra)", value=False)
-    device = "cuda" if use_gpu else "cpu"
-
-if model_file is None:
-    st.info("Įkelk modelį šone, kad matytum prognozes. Rekomenduojama: TorchScript (.pt/.ts).")
-else:
-    try:
-        # 1) Užkraunam modelį į session_state (kad nereikėtų krauti per kiekvieną rerun)
-        if ("model_name" not in st.session_state) or (st.session_state.model_name != model_file.name):
-            raw_bytes = model_file.getvalue()
-
-            # bandome TorchScript
-            model = None
-            try:
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".pt") as tmp:
-                    tmp.write(raw_bytes)
-                    tmp.flush()
-                    tmp_path = tmp.name
-                model = torch.jit.load(tmp_path, map_location=device)
-                model.eval()
-                st.session_state.model_type = "torchscript"
-            except Exception:
-                model = None
-
-            # jei ne TorchScript, bandome state_dict su SimpleSleepCNN
-            if model is None:
-                state = torch.load(
-                    tempfile.NamedTemporaryFile(delete=False, suffix=".pth").name,
-                    map_location=device
-                )
-                # ^ viršuj dar neįrašėm bytes, todėl darom teisingai:
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".pth") as tmp:
-                    tmp.write(raw_bytes)
-                    tmp.flush()
-                    sd_path = tmp.name
-                state = torch.load(sd_path, map_location=device)
-
-                model = SimpleSleepCNN(n_classes=len(STAGE_NAMES)).to(device)
-                model.load_state_dict(state)
-                model.eval()
-                st.session_state.model_type = "state_dict(SimpleSleepCNN)"
-
-            st.session_state.model = model
-            st.session_state.model_name = model_file.name
-
-        model = st.session_state.model
-
-        # 2) Paruošiam input epochą (B,1,T)
-        x = normalize_epoch(epoch).astype(np.float32)
-        x_t = torch.from_numpy(x).unsqueeze(0).unsqueeze(0).to(device)  # [1,1,T]
-
-        with torch.no_grad():
-            logits = model(x_t)
-            probs = torch.softmax(logits, dim=-1).detach().cpu().numpy().reshape(-1)
-
-        pred_id = int(np.argmax(probs))
-        pred_name = STAGE_NAMES[pred_id]
-
-        st.write(f"**Modelis:** `{st.session_state.model_type}` | failas: `{st.session_state.model_name}`")
-        st.write(f"**True:** {label_name} | **Pred:** **{pred_name}**")
-
-        # 3) Softmax bar chart
-        prob_dict = {STAGE_NAMES[i]: float(probs[i]) for i in range(len(STAGE_NAMES))}
-        st.bar_chart(prob_dict)
-
-        # 4) (bonus) prognozės visam langui + accuracy
-        if st.checkbox("Skaičiuoti prognozes visam langui (lėčiau)", value=False):
-            Xw_norm = Xw[:, 0, :].astype(np.float32)
-            # normalizuojam per epochą
-            mu = Xw_norm.mean(axis=1, keepdims=True)
-            sd = Xw_norm.std(axis=1, keepdims=True) + 1e-8
-            Xw_norm = (Xw_norm - mu) / sd
-
-            batch = st.slider("Batch size", 16, 256, 64, 16)
-            preds = []
-            with torch.no_grad():
-                for i in range(0, Xw_norm.shape[0], batch):
-                    xb = torch.from_numpy(Xw_norm[i:i+batch]).unsqueeze(1).to(device)  # [B,1,T]
-                    pb = torch.softmax(model(xb), dim=-1).argmax(dim=-1).cpu().numpy()
-                    preds.append(pb)
-            y_pred = np.concatenate(preds, axis=0)
-
-            acc = float(np.mean(y_pred == yw[:len(y_pred)]))
-            st.write(f"**Window accuracy:** {acc*100:.1f}%")
-
-    except Exception as e:
-        st.error("Modelio užkrovimas / predikcija nepavyko. Klaida:")
-        st.exception(e)
-
-
-st.divider()
-st.subheader("Modelio prognozės (paruošta plėtrai)")
-st.info("Čia vėliau prijungsi apmokytą CNN / BiLSTM / Transformer ir rodysi softmax tikimybes pasirinktai epochai.")
